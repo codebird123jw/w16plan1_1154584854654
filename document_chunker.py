@@ -13,7 +13,7 @@ def clean_text(text):
     # 2. 開始進行暴力清洗
     # 情況 A：如果你的 PDF 裡面真的印著英文字母 "XXX"
     text = text.replace("機密,,", "")#機密CODE
-    #text = text.replace("，保密至民國116 年3 月29 日，解除密等）", "")
+    #text = text.replace("，）", "")
     
     # 情況 B
     # \d+ 代表一個或多個數字，\s* 代表可能存在的空白
