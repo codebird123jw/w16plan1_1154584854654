@@ -43,9 +43,9 @@ passage_texts = ["passage: " + text for text in corpus_texts]
 corpus_embeddings = model.encode(passage_texts, convert_to_tensor=True, show_progress_bar=True)
 
 # ==========================================
-# 3. 第一步：Dense 檢索評估與分數正規化
+# 3. 第一步：Dense 檢索評估與分數正規化 (包含詳細 CSV 匯出)
 # ==========================================
-eval_k = 10 # 🌟 跨段落通常需要更大的 Top-K 視窗，設為 10
+eval_k = 10 
 total_queries = len(queries_df)
 
 dense_partial_hits = 0
@@ -55,43 +55,79 @@ dense_mrr_sum = 0.0
 
 normalized_results_buffer = [] 
 
-print(f"\n開始評估 {total_queries} 條 Queries，進行分數正規化...")
+# 🌟 新增：準備用來寫入詳細 CSV 的資料容器
+bm25_export_data = []
+e5_export_data = []
+
+print(f"\n開始評估 {total_queries} 條 Queries，進行分數正規化與詳細紀錄匯出...")
 
 for index, row in queries_df.iterrows():
     query_text = row['Query']
-    # 🌟 核心：解析出這題所有需要的標準答案 Chunk ID
-    gt_chunks = json.loads(row['Ground_Truth_Chunks'])
+    gt_chunks = json.loads(row['Ground_Truth_Chunks']) # 這是一個 List，例如 ['chunk_01', 'chunk_02']
     required_count = len(gt_chunks)
     
-    # 取得 BM25 正規化分數
+    # --- 取得 BM25 正規化分數 ---
     tokenized_query = secure_ngram_tokenize(query_text)
     bm25_scores = np.array(bm25.get_scores(tokenized_query)) 
     norm_bm25 = min_max_normalize(bm25_scores)
     
-    # 取得 Dense 正規化分數
+    # --- 取得 Dense 正規化分數 ---
     query_embedding = model.encode("query: " + query_text, convert_to_tensor=True)
     dense_scores = util.cos_sim(query_embedding, corpus_embeddings)[0].cpu().numpy()
     norm_dense = min_max_normalize(dense_scores)
     
-    # --- Dense 效能計算 ---
-    dense_top_indices = np.argsort(dense_scores)[::-1][:eval_k]
-    dense_top_ids = [corpus_ids[i] for i in dense_top_indices]
+    # ==================================================
+    # 🌟 新增：紀錄前 K 名的結果供 CSV 匯出 (追蹤肉搏戰細節)
+    # ==================================================
     
-    # 計算命中哪些標準答案
+    # 紀錄 BM25 的前 K 名
+    bm25_top_indices = np.argsort(bm25_scores)[::-1][:eval_k]
+    for rank_idx, chunk_idx in enumerate(bm25_top_indices):
+        retrieved_id = corpus_ids[chunk_idx]
+        bm25_export_data.append({
+            "Query": query_text,
+            "N_Gram_Tokens": str(tokenized_query), # 紀錄 N-gram 具體長相
+            "Ground_Truth_IDs": str(gt_chunks),    # 跨段落的所有標準答案
+            "Rank": rank_idx + 1,
+            "Retrieved_Chunk_ID": retrieved_id,
+            # 判斷這個撈出來的 ID，是否是跨段落答案的其中一塊拼圖
+            "Is_Correct_Part": "Yes" if retrieved_id in gt_chunks else "No",
+            "BM25_Raw_Score": round(bm25_scores[chunk_idx], 4),
+            "Normalized_Score": round(norm_bm25[chunk_idx], 4),
+            "Retrieved_Text": corpus_texts[chunk_idx]
+        })
+        
+    # 紀錄 E5 的前 K 名
+    dense_top_indices = np.argsort(dense_scores)[::-1][:eval_k]
+    for rank_idx, chunk_idx in enumerate(dense_top_indices):
+        retrieved_id = corpus_ids[chunk_idx]
+        e5_export_data.append({
+            "Query": query_text,
+            "Ground_Truth_IDs": str(gt_chunks),
+            "Rank": rank_idx + 1,
+            "Retrieved_Chunk_ID": retrieved_id,
+            "Is_Correct_Part": "Yes" if retrieved_id in gt_chunks else "No",
+            "Cosine_Similarity": round(float(dense_scores[chunk_idx]), 4),
+            "Normalized_Score": round(norm_dense[chunk_idx], 4),
+            "Retrieved_Text": corpus_texts[chunk_idx]
+        })
+
+    # ==================================================
+    # --- 原本的 Dense 效能計算 ---
+    dense_top_ids = [corpus_ids[i] for i in dense_top_indices]
     hits_in_top = [gt for gt in gt_chunks if gt in dense_top_ids]
     hit_count = len(hits_in_top)
     
     if hit_count > 0:
         dense_partial_hits += 1
         dense_prop_recall_sum += (hit_count / required_count)
-        
         ranks = [dense_top_ids.index(gt) + 1 for gt in hits_in_top]
         dense_mrr_sum += (1.0 / min(ranks))
         
     if hit_count == required_count:
         dense_strict_hits += 1
 
-    # 🌟 寫入暫存區 (將 gt_chunks 陣列一併存入)
+    # 寫入暫存區傳給後面的步驟
     normalized_results_buffer.append({
         "query_text": query_text,
         "ground_truth_chunks": gt_chunks,
@@ -99,6 +135,13 @@ for index, row in queries_df.iterrows():
         "norm_bm25_scores": norm_bm25,
         "norm_dense_scores": norm_dense
     })
+
+# 🌟 新增：將收集到的詳細資料匯出成 CSV
+print("\n正在匯出檢索底層詳細報告...")
+pd.DataFrame(bm25_export_data).to_csv("bm25_detailed_results_multi.csv", index=False, encoding="utf-8-sig")
+pd.DataFrame(e5_export_data).to_csv("e5_detailed_results_multi.csv", index=False, encoding="utf-8-sig")
+print("✅ 成功產生 bm25_detailed_results_multi.csv (包含 N-gram 切詞與分數)")
+print("✅ 成功產生 e5_detailed_results_multi.csv (包含 E5 相似度與分數)")
 
 # --- 印出 Baseline 2 報告 ---
 print("\n" + "=" * 50)
@@ -203,36 +246,52 @@ def get_llm_score_ollama(query, document, model_name="gemma3:12b"):
     except Exception as e:
         return 0 
 
-# DAT 統計數據
+# ... (前面保留：準備啟動 DAT 推論的 print 與 LLM 函數等) ...
+
 dat_prop_sum = 0.0
 dat_strict_hits = 0
 dat_mrr_sum = 0.0
+
+# 🌟 1. 新增：準備用來裝對決資料的容器
+dat_case_study_data = [] 
 
 print(f"啟動 DAT 推論，預計推論 {total_queries * 2} 次...")
 
 for index, item in enumerate(normalized_results_buffer):
     query_text = item['query_text']
-    gt_chunks = item['ground_truth_chunks']
+    gt_chunks = item['ground_truth_chunks'] # 這是一個 List
     req_count = item['required_count']
     norm_bm25 = item['norm_bm25_scores']
     norm_dense = item['norm_dense_scores']
     
+    # 🌟 2. 修改：找出跨段落 Ground Truth 的所有實際文本，並把它們串接起來
+    gt_texts = []
+    for gt_id in gt_chunks:
+        if gt_id in corpus_ids:
+            gt_index = corpus_ids.index(gt_id)
+            # 在文本前面加上 [chunk_ID] 標籤，方便你在 Excel 裡閱讀
+            gt_texts.append(f"[{gt_id}]\n{corpus_texts[gt_index]}")
+    # 用兩個換行符號把多個段落隔開
+    ground_truth_text = "\n\n".join(gt_texts) 
+    
+    # 3-1. 抽取各自的 Top-1 文件
     top1_bm25_idx = np.argmax(norm_bm25)
     top1_dense_idx = np.argmax(norm_dense)
     doc_b1 = corpus_texts[top1_bm25_idx]
     doc_v1 = corpus_texts[top1_dense_idx]
     
+    # 3-2. Local LLM 評分器 (取得 Sb 與 Sv)
     score_b = get_llm_score_ollama(query_text, doc_b1) 
     score_v = get_llm_score_ollama(query_text, doc_v1) 
     
-    # DAT Alpha 計算邏輯不變
+    # 3-3. 計算動態 Alpha
     if score_v == 0 and score_b == 0: alpha_q = 0.5
     elif score_v == 5 and score_b != 5: alpha_q = 1.0
     elif score_b == 5 and score_v != 5: alpha_q = 0.0
     else: alpha_q = score_v / (score_v + score_b) if (score_v + score_b) > 0 else 0.5
     alpha_q = round(alpha_q, 1)
     
-    # 進行最終檢索與排序
+    # 3-4. 進行最終檢索與排序
     dat_scores = (alpha_q * norm_dense) + ((1.0 - alpha_q) * norm_bm25)
     top_indices = np.argsort(dat_scores)[::-1][:eval_k]
     top_ids = [corpus_ids[i] for i in top_indices]
@@ -241,15 +300,41 @@ for index, item in enumerate(normalized_results_buffer):
     hits = [gt for gt in gt_chunks if gt in top_ids]
     hit_c = len(hits)
     
+    # 🌟 3. 修改：跨段落排名的紀錄方式
+    final_rank = "Out of Top 10" # 假設 eval_k 是 10
     if hit_c > 0:
         dat_prop_sum += (hit_c / req_count)
+        # 找出命中名單中，排名最高的那一個 (First-Hit Rank)
         ranks = [top_ids.index(gt) + 1 for gt in hits]
-        dat_mrr_sum += (1.0 / min(ranks))
+        best_rank = min(ranks)
+        dat_mrr_sum += (1.0 / best_rank)
+        # 紀錄：顯示最好名次，以及總共撈到幾塊拼圖
+        final_rank = f"First Hit Rank {best_rank} (Found {hit_c}/{req_count})"
+        
     if hit_c == req_count:
         dat_strict_hits += 1
 
+    # 🌟 4. 新增：將這一回合的完整戰況存入 List
+    dat_case_study_data.append({
+        "Query": query_text,
+        "Ground_Truth_Text": ground_truth_text,
+        "BM25_Top1_Text": doc_b1,
+        "E5_Top1_Text": doc_v1,
+        "Score_B_BM25": score_b,
+        "Score_V_E5": score_v,
+        "Calculated_Alpha": alpha_q,
+        "DAT_Final_Rank": final_rank
+    })
+
     if (index + 1) % 10 == 0:
         print(f"進度 [{index+1}/{total_queries}] | Sb={score_b}, Sv={score_v} -> Alpha={alpha_q}")
+
+# 🌟 5. 新增：迴圈結束後，匯出 DAT 案例分析報告
+print("\n正在匯出 DAT 跨段落案例分析報告 (DAT_case_study_multi.csv)...")
+pd.DataFrame(dat_case_study_data).to_csv("DAT_case_study_multi.csv", index=False, encoding="utf-8-sig")
+print("✅ 成功產生 DAT_case_study_multi.csv！")
+
+# ... (後面保留計算平均分數與印出 Baseline 3 報告的程式碼) ...
 
 dat_avg_prop = (dat_prop_sum / total_queries) * 100
 dat_avg_strict = (dat_strict_hits / total_queries) * 100
